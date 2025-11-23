@@ -671,6 +671,13 @@ async def handle_media_stream(websocket: WebSocket):
                     elif pkt.get("event") == "media":
                         if openai_ws is None:               # socket not ready yet
                             continue                        # ignore early packets
+
+                        # If the AI is mid-sentence, stop the TTS stream so callers can barge in
+                        if ai_is_speaking:
+                            logging.info("[INTERRUPT] caller spoke while AI talking – cancelling response")
+                            await send_stop_audio(openai_ws)
+                            ai_is_speaking = False
+
                         await openai_ws.send(json.dumps({
                             "type":  "input_audio_buffer.append",
                             "audio": pkt["media"]["payload"]
