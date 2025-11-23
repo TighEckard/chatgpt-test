@@ -533,6 +533,7 @@ async def handle_media_stream(websocket: WebSocket):
             # Runtime flags
             ai_is_speaking      = False
             last_audio_received = None
+            last_barge_in       = 0.0
             redirect_triggered  = False
 
             # ------------------------------------------------------------------
@@ -594,7 +595,7 @@ async def handle_media_stream(websocket: WebSocket):
 
             # ---------- Twilio → OpenAI pump ----------
             async def receive_from_twilio():
-                nonlocal stream_sid, call_sid, openai_ws
+                nonlocal stream_sid, call_sid, openai_ws, last_barge_in
 
 
                 async for raw in websocket.iter_text():
@@ -677,6 +678,7 @@ async def handle_media_stream(websocket: WebSocket):
                             logging.info("[INTERRUPT] caller spoke while AI talking – cancelling response")
                             await send_stop_audio(openai_ws)
                             ai_is_speaking = False
+                            last_barge_in = asyncio.get_event_loop().time()
 
                         await openai_ws.send(json.dumps({
                             "type":  "input_audio_buffer.append",
@@ -821,7 +823,7 @@ async def handle_media_stream(websocket: WebSocket):
             #  OpenAI ➜ Twilio pump  (GPT output + caller transcript)
             # --------------------------------------------------------------
             async def process_openai_responses():
-                nonlocal ai_is_speaking, last_audio_received, redirect_triggered, stream_sid
+                nonlocal ai_is_speaking, last_audio_received, redirect_triggered, stream_sid, last_barge_in
 
                 async for raw in openai_ws:
                     # stop everything once we’ve transferred the call
@@ -925,7 +927,14 @@ async def handle_media_stream(websocket: WebSocket):
                         elif kind.startswith("response.audio"):
                             audio_payload = msg.get("delta") or msg.get("audio")
                             if audio_payload:
-                                last_audio_received = asyncio.get_event_loop().time()
+                                now = asyncio.get_event_loop().time()
+
+                                # Drop any leftover frames that arrive right after a barge-in
+                                if last_barge_in and (now - last_barge_in) < 1.0:
+                                    logging.debug("[INTERRUPT] skipping stale TTS frame after barge-in")
+                                    continue
+
+                                last_audio_received = now
                                 ai_is_speaking = True
                                 await websocket.send_json({
                                     "event":     "media",
