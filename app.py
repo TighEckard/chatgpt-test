@@ -4,7 +4,8 @@ import sys
 import json
 import base64
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 import asyncio
 import requests
 import websockets
@@ -243,25 +244,29 @@ def _polish_transcript(raw: list[dict]) -> list[dict]:
 
 
 
-# OpenAI API key (replace with your actual key)
-OPENAI_API_KEY = "SECRET"
-PORT = 5050
+# OpenAI & server configuration via environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "SECRET")
+PORT = int(os.getenv("PORT", "5050"))
 openai.api_key = OPENAI_API_KEY
-
 
 
 #############################
 # CONFIGURE WORDPRESS SITE #
 #############################
-WORDPRESS_SITE_URL = "https://app.kalimba.world"
+WORDPRESS_SITE_URL = os.getenv("WP_BASE_URL", "https://app.kalimba.world")
+AI_API_KEY = os.getenv("AI_API_KEY", "")
+BUSINESS_PHONE = os.getenv("BUSINESS_PHONE", "")
+SERVICE_ID = os.getenv("SERVICE_ID", "")
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "UTC")
 # If your WordPress endpoint needs a nonce or auth header, set it here:
 # WP_API_NONCE = "SOME_NONCE_IF_NEEDED"
 
 
-
+#############################
 # Twilio credentials (use your real credentials!)
-TWILIO_ACCOUNT_SID = "SECRET"
-TWILIO_AUTH_TOKEN = "SECRET"
+#############################
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "SECRET")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "SECRET")
 
 
 ######################################
@@ -395,6 +400,137 @@ def get_user_voice_by_phone(phone: str) -> str:
         logging.exception(f"[WP:get_voice] EXCEPTION {e}")
     # in case of any error, fallback
     return DEFAULT_VOICE
+
+
+# ---------------------------------------------------------------------------
+# WordPress AI booking helpers
+# ---------------------------------------------------------------------------
+
+def _wp_headers() -> dict:
+    """Common headers for WordPress AI endpoints."""
+    headers = {"Content-Type": "application/json"}
+    if AI_API_KEY:
+        headers["Authorization"] = f"Bearer {AI_API_KEY}"
+    return headers
+
+
+def check_availability(from_iso: str, to_iso: str, party: int, service_id: str, room_id: str = "any") -> dict:
+    """Query free slots from WordPress."""
+    params = {
+        "phone": BUSINESS_PHONE,
+        "from": from_iso,
+        "to": to_iso,
+        "party": party,
+        "service_id": service_id,
+        "room_id": room_id,
+    }
+    resp = requests.get(
+        f"{WORDPRESS_SITE_URL}/wp-json/ai-reception/v1/ai/availability",
+        params=params,
+        headers=_wp_headers(),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def hold_slot(
+    room_id: str,
+    service_id: str,
+    start_ts: str,
+    end_ts: str,
+    party: int,
+    cust_name: str,
+    cust_phone: str,
+) -> dict:
+    """Place a temporary hold on a slot."""
+    payload = {
+        "room_id": room_id,
+        "service_id": service_id,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "party": party,
+        "cust_name": cust_name,
+        "cust_phone": cust_phone,
+    }
+    resp = requests.post(
+        f"{WORDPRESS_SITE_URL}/wp-json/ai-reception/v1/ai/hold",
+        params={"phone": BUSINESS_PHONE},
+        headers=_wp_headers(),
+        json=payload,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def confirm_hold(
+    hold_id: str,
+    room_id: str,
+    party: int,
+    cust_name: str,
+    cust_phone: str,
+    cust_email: str,
+    notes: str = "",
+) -> dict:
+    """Confirm a held slot into a booking."""
+    payload = {
+        "hold_id": hold_id,
+        "room_id": room_id,
+        "party": party,
+        "cust_name": cust_name,
+        "cust_phone": cust_phone,
+        "cust_email": cust_email,
+        "notes": notes,
+    }
+    resp = requests.post(
+        f"{WORDPRESS_SITE_URL}/wp-json/ai-reception/v1/ai/confirm",
+        params={"phone": BUSINESS_PHONE},
+        headers=_wp_headers(),
+        json=payload,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def find_consecutive_nights(
+    from_day: date,
+    nights: int,
+    party: int,
+    service_id: str,
+    room_id: str = "any",
+) -> list[dict]:
+    """Return room options free for the same room across `nights` nights."""
+    tz = ZoneInfo(DEFAULT_TZ)
+    cur = from_day
+    first_day_slots: dict[str, dict] | None = None
+    room_candidates: set[str] | None = None
+
+    for _ in range(nights):
+        start = datetime.combine(cur, datetime.min.time(), tzinfo=tz)
+        end = start + timedelta(days=1)
+        avail = check_availability(start.isoformat(), end.isoformat(), party, service_id, room_id)
+        day_slots = {s["room_id"]: s for s in avail.get("slots", [])}
+        if not day_slots:
+            return []
+        if room_candidates is None:
+            room_candidates = set(day_slots.keys())
+            first_day_slots = day_slots
+        else:
+            room_candidates &= set(day_slots.keys())
+        if not room_candidates:
+            return []
+        cur += timedelta(days=1)
+
+    results = []
+    for rid in room_candidates or []:
+        start_ts = first_day_slots[rid]["start_ts"]
+        start_dt = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+        end_dt = start_dt + timedelta(days=nights)
+        end_ts = end_dt.isoformat().replace("+00:00", "Z")
+        results.append({"room_id": rid, "start_ts": start_ts, "end_ts": end_ts})
+    return results
 
 
 
