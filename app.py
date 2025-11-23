@@ -942,9 +942,18 @@ async def handle_media_stream(websocket: WebSocket):
                                     "media":     {"payload": audio_payload}
                                 })
 
-                        # ── 6) Errors from the OpenAI stream ───────────────
+                        # ── 6) End-of-response markers ─────────────────────
+                        elif kind in {"response.completed", "response.canceled", "response.stopped"}:
+                            # OpenAI signals that the assistant finished speaking;
+                            # clear the speaking flag so new caller audio doesn’t get treated
+                            # as a late barge-in.
+                            ai_is_speaking = False
+                            last_audio_received = None
+
+                        # ── 7) Errors from the OpenAI stream ───────────────
                         elif kind == "error":
                             logging.error(f"[OPENAI-ERR] {msg}")
+
 
                     except Exception as exc:
                         logging.error(f"[OPENAI-PARSE] {exc}")
